@@ -1,0 +1,56 @@
+name: Factory wake
+
+# Wakes the automation when main moves, which is what a merged pull request does, and when the owner
+# writes a command in a pull request (a comment that starts with "/": /merge, /round: ..., /close).
+# The job starts one dispatcher tick and does nothing else. It reads nothing from the push or the comment beyond
+# the conditions of the job, and it never checks out code. The dispatcher reads the comment itself and checks its
+# author again.
+#
+# The trigger of a merge is the push, not the closed pull request:
+#   - GitHub blocks pull_request_target in public repositories by default from December 2, 2026;
+#   - a run of pull_request_target whose pull request Copilot opened waits for a person's approval, so the merge
+#     of an agent's pull request would start no tick. The actor of a push is the person who merged.
+# The end of an agent session or of a CI run is not a trigger either: GitHub holds every workflow run whose actor
+# is Copilot until a person approves it. factory-timer.yml covers those.
+#
+# No secret is used: the job starts factory-tick.yml with its own GITHUB_TOKEN.
+
+on:
+  push:
+    branches:
+      - main
+  issue_comment:
+    types:
+      - created
+
+permissions: {}
+
+concurrency:
+  # One wake runs and at most one waits; a burst of events becomes one more tick.
+  group: factory-wake
+  cancel-in-progress: false
+
+jobs:
+  wake:
+    # Only people with write access can push to main, so a fork cannot start ticks. A comment starts
+    # a tick only when the maintainer (ignatov) wrote it in a pull request and it starts with "/".
+    if: >-
+      vars.FACTORY_TICK_LIVE == 'true' && (github.event_name == 'push'
+      || (github.event_name == 'issue_comment'
+        && github.event.issue.pull_request
+        && github.event.comment.user.login == 'ignatov'
+        && startsWith(github.event.comment.body, '/')))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Start a tick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          if ! gh workflow run factory-tick.yml -R "$REPO" --ref main -f live=true; then
+            echo "::error::The tick could not be started."
+            exit 1
+          fi

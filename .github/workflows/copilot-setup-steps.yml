@@ -1,0 +1,20 @@
+name: Copilot Setup Steps
+
+# Prepares the environment of every Copilot cloud agent session (fixer and reviewer): the toolchain that the
+# commands in AGENTS.md need. The job must be named copilot-setup-steps.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: [.github/workflows/copilot-setup-steps.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  copilot-setup-steps:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # The runner's own Python 3 is all this project needs.
+      - run: python3 --version

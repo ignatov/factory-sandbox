@@ -1,0 +1,75 @@
+name: Factory timer
+
+# The clock of the automation. The dispatcher (factory-tick.yml) has to see the end of each agent session and CI
+# run. GitHub drops most scheduled runs of a quiet repository, so each live tick arms this timer at its end instead:
+#   1. the job "wait" waits in the environment factory-timer-<pace>; the wait timer of that environment decides
+#      how long (active: 10 minutes, while a session or a CI run can end; idle: 15 minutes); no runner is used
+#      while it waits;
+#   2. the job "wake" starts the next tick, factory-tick.yml of main with live.
+# A new run cancels the one that is still waiting, so there is always one timer.
+#
+# Both environments must exist with their wait timers (setup.py makes them): GitHub creates an environment that
+# does not exist, without a wait timer, and the chain would then spin as fast as the runs start.
+#
+# The tick and this timer start each other with their own GITHUB_TOKEN: workflow_dispatch is one of the two events
+# that this token may start a run with. No secret is used here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pace:
+        description: the environment factory-timer-<pace> to wait in; its wait timer decides how long
+        type: choice
+        options:
+          - active
+          - idle
+        default: idle
+
+permissions: {}
+
+concurrency:
+  group: factory-timer
+  cancel-in-progress: true
+
+jobs:
+  wait:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment:
+      name: factory-timer-${{ inputs.pace }}
+      # The environment is used for its wait timer only; this is not a deployment.
+      deployment: false
+    steps:
+      - run: echo "The wait is over."
+
+  wake:
+    needs: wait
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Start the watch when it has no run
+        # factory-watch.yml has a loop of its own; this restarts it when it broke. It never fails this job.
+        if: vars.FACTORY_WATCH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          busy=$(gh run list -R "$REPO" -w factory-watch.yml -L 20 --json status \
+            --jq '[.[] | select(.status != "completed")] | length') || busy=""
+          if [ "$busy" = "0" ]; then
+            gh workflow run factory-watch.yml -R "$REPO" --ref main -f wait=true \
+              || echo "::warning::The watch could not be started."
+          fi
+
+      - name: Start the next tick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          if ! gh workflow run factory-tick.yml -R "$REPO" --ref main -f live=true; then
+            echo "::error::The next tick could not be started."
+            exit 1
+          fi

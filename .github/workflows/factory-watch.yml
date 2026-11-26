@@ -1,0 +1,151 @@
+name: Factory watch
+
+# A watchdog of the automation, without a model: it tells the maintainer when the factory stalls. The tick can stop
+# without anyone noticing: a state that could not be pushed halts the chain, the timer chain dies, a session never
+# ends, CI of main is red. This workflow runs dispatcher/watch.py of the desk, which reads what the tick
+# leaves behind and the public Actions runs, and announces each new alert, and each recovery, in one comment on a
+# standing issue of this repository (the variable FACTORY_WATCH_ISSUE), with a mention of the maintainer.
+#
+# It must not depend on the tick, because the tick is what dies. Its own clock:
+#   1. a loop of its own: each run ends by starting the next one with wait=true; that run first waits in the
+#      environment factory-timer-idle (15 minutes), using no runner while it waits. The next run is started also
+#      when the check failed. An environment that does not exist is created by GitHub without a wait timer, so a
+#      run with wait=true that reaches the job rearm in less than 10 minutes stops the loop with an error.
+#   2. the timer of the tick (factory-timer.yml) starts this workflow whenever it has no run that is queued,
+#      waiting or running, so each live chain restarts the other one;
+#   3. a schedule twice an hour, the last backstop (GitHub drops most scheduled runs, so it is no clock by itself).
+#
+# Who is told: the comments are written with GITHUB_TOKEN, so they are by github-actions[bot] and not by the owner,
+# whose own actions GitHub does not notify him of. A scheduled run that finds a critical alert open fails, and
+# GitHub mails a failed scheduled run to whoever last changed its cron.
+#
+# What keeps the secrets in, as in factory-tick.yml: the desk token is a secret of the environment factory-dispatch
+# and reaches only the git step; watch.py gets only GITHUB_TOKEN. No "uses:" step, nothing from this tree runs. The
+# public log shows only counts; what is written on the issue names only numbers, fixed phrases and times.
+#
+# Repository variables: FACTORY_WATCH ("true" turns it on), FACTORY_WATCH_ISSUE (the number of the standing issue),
+# FACTORY_WATCH_TIMER ("false" stops the loop; the schedule still runs). FACTORY_TICK_LIVE is read, so a factory
+# that the maintainer stopped is not reported as dead.
+
+on:
+  workflow_dispatch:
+    inputs:
+      wait:
+        description: Wait in the timer environment first (the loop); off for a check right now
+        type: boolean
+        default: false
+  schedule:
+    - cron: '7,37 * * * *'
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  wait:
+    if: inputs.wait && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # One loop: a newer waiting run replaces this one and carries the loop on.
+    concurrency:
+      group: factory-watch-wait
+      cancel-in-progress: true
+    environment:
+      name: factory-timer-idle
+      deployment: false
+    steps:
+      - run: echo "The wait is over."
+
+  check:
+    needs: wait
+    if: >-
+      always() && vars.FACTORY_WATCH == 'true' && github.ref == 'refs/heads/main'
+      && (needs.wait.result == 'success' || needs.wait.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      issues: write
+    # Two checks never post at once.
+    concurrency:
+      group: factory-watch-check
+      cancel-in-progress: false
+    environment:
+      name: factory-dispatch
+      deployment: false
+    env:
+      DESK_REPO: ignatov/factory-sandbox-factory
+      GIT_TERMINAL_PROMPT: '0'
+      GIT_CONFIG_NOSYSTEM: '1'
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: credential.helper
+      GIT_CONFIG_VALUE_0: ''
+    steps:
+      - name: Fetch the desk
+        env:
+          DESK_TOKEN: ${{ secrets.FACTORY_DESK_TOKEN || secrets.FACTORY_TOKEN }}
+        run: |
+          cat > "$RUNNER_TEMP/askpass.sh" <<'SCRIPT'
+          #!/bin/sh
+          case "$1" in
+            Username*) echo x-access-token ;;
+            *) printf '%s\n' "$DESK_TOKEN" ;;
+          esac
+          SCRIPT
+          chmod 700 "$RUNNER_TEMP/askpass.sh"
+          export GIT_ASKPASS="$RUNNER_TEMP/askpass.sh"
+          git clone --quiet --depth 1 --single-branch --branch main "https://github.com/$DESK_REPO.git" "$RUNNER_TEMP/desk" \
+            > /dev/null 2>&1 || { echo "::error::The desk could not be fetched."; exit 1; }
+          git -C "$RUNNER_TEMP/desk" ls-remote --heads origin > "$RUNNER_TEMP/branches.txt" 2> /dev/null \
+            || { echo "::error::The branches of the desk could not be listed."; exit 1; }
+          rm -f "$RUNNER_TEMP/askpass.sh"
+
+      - name: Check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ vars.FACTORY_WATCH_ISSUE }}
+          TICK_LIVE: ${{ vars.FACTORY_TICK_LIVE }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          case "$ISSUE" in ''|*[!0-9]*) echo "::error::The variable FACTORY_WATCH_ISSUE is not a number."; exit 1 ;; esac
+          fail=""
+          if [ "$EVENT" = "schedule" ]; then fail="--fail-on-critical"; fi
+          cd "$RUNNER_TEMP/desk"
+          # watch.py prints one line of counts with --notify.
+          python3 dispatcher/watch.py --branches "$RUNNER_TEMP/branches.txt" --notify "$ISSUE" --tick-live "$TICK_LIVE" $fail
+
+  rearm:
+    needs: [wait, check]
+    # Also after a red check, so that an alert does not end the loop; not when the check did not run.
+    if: >-
+      always() && vars.FACTORY_WATCH_TIMER != 'false'
+      && (needs.check.result == 'success' || needs.check.result == 'failure')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Start the next run of the loop
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          WAITED: ${{ inputs.wait }}
+        run: |
+          if [ "$WAITED" = "true" ]; then
+            created=$(gh run view "$RUN_ID" -R "$REPO" --json createdAt --jq .createdAt) || created=""
+            age=$(( $(date -u +%s) - $(date -u -d "$created" +%s 2>/dev/null || echo 0) ))
+            if [ -z "$created" ] || [ "$age" -lt 600 ]; then
+              echo "::error::This run waited less than 10 minutes: the environment factory-timer-idle has no wait timer. The loop stops here."
+              exit 1
+            fi
+          fi
+          busy=$(gh run list -R "$REPO" -w factory-watch.yml -L 20 --json status,databaseId \
+            --jq "[.[] | select(.status != \"completed\" and .databaseId != $RUN_ID)] | length") || busy=""
+          if [ "$busy" = "0" ]; then
+            gh workflow run factory-watch.yml -R "$REPO" --ref main -f wait=true
+          else
+            echo "Another run of the watch carries the loop on."
+          fi
